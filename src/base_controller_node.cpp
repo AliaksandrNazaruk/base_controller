@@ -1,18 +1,19 @@
 #include <chrono>
-#include <algorithm>
 #include <memory>
-#include <string>
 
 #include "rclcpp/executors/single_threaded_executor.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 
+#include "base_controller/robot_state.hpp"
+#include "base_controller/async_driver_client.hpp"
+#include "base_controller/command_arbitrator.hpp"
+
 #include "geometry_msgs/msg/twist.hpp"
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "diagnostic_msgs/msg/diagnostic_status.hpp"
 #include "std_msgs/msg/bool.hpp"
-
-#include "base_controller/async_driver_client.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 using namespace std::chrono_literals;
 
@@ -27,6 +28,43 @@ public:
   {}
 
   // ============================================================
+  // Robot state update
+  // ============================================================
+
+  void updateRobotState()
+  {
+    if (!driver_client_) {
+      robot_state_.driver_fault = true;
+      robot_state_.driver_ready = false;
+      return;
+    }
+
+    robot_state_.driver_fault = !driver_client_->isHealthy();
+
+    // TODO: driver_ready must be independent from fault
+    // ready = initialized + enabled + no inhibit
+    robot_state_.driver_ready = !robot_state_.driver_fault;
+
+    if (!robot_state_.driver_fault) {
+      robot_state_.last_feedback_ts = now();
+    }
+
+    // Stubs for future HW integration
+    robot_state_.estop_hw_active = false;
+    robot_state_.velocity_zero  = true;
+  }
+
+  // ============================================================
+  // SAFETY FSM
+  // ============================================================
+
+  enum class SafetyState {
+    SAFE,
+    OPERATIONAL,
+    EMERGENCY
+  };
+
+  // ============================================================
   // Lifecycle
   // ============================================================
 
@@ -34,57 +72,61 @@ public:
   {
     control_rate_hz_    = declare_parameter<double>("control_rate_hz", 20.0);
     cmd_vel_timeout_ms_ = declare_parameter<int>("cmd_vel_timeout_ms", 200);
-    max_linear_mps_     = declare_parameter<double>("max_linear_mps", 0.6);
-    max_angular_rps_    = declare_parameter<double>("max_angular_rps", 1.2);
-    driver_endpoint_ =
+    feedback_timeout_ms_= declare_parameter<int>("feedback_timeout_ms", 500);
+    driver_endpoint_    =
       declare_parameter<std::string>("driver_endpoint", "http://localhost:8105");
-
-    // --- Command source metadata ---
-    cmd_nav_.priority    = 10;
-    cmd_nav_.name        = "nav";
-
-    cmd_teleop_.priority = 50;
-    cmd_teleop_.name     = "teleop";
-
-    cmd_safe_.priority   = 90;
-    cmd_safe_.name       = "safe";
 
     driver_client_ = std::make_unique<AsyncDriverClient>(driver_endpoint_);
 
-    // --- Command inputs ---
+    arbitrator_.setTimeoutMs(cmd_vel_timeout_ms_);
+    arbitrator_.addSource("nav",    10);
+    arbitrator_.addSource("teleop", 50);
+    arbitrator_.addSource("safe",   90);
 
     cmd_nav_sub_ = create_subscription<geometry_msgs::msg::Twist>(
-      "/cmd_vel_nav", rclcpp::QoS(10),
+      "/cmd_vel_nav", 10,
       [this](geometry_msgs::msg::Twist::SharedPtr msg) {
-        cmd_nav_.last  = *msg;
-        cmd_nav_.stamp = now();
+        arbitrator_.updateSource("nav", *msg, now());
       });
 
     cmd_teleop_sub_ = create_subscription<geometry_msgs::msg::Twist>(
-      "/cmd_vel_teleop", rclcpp::QoS(10),
+      "/cmd_vel_teleop", 10,
       [this](geometry_msgs::msg::Twist::SharedPtr msg) {
-        cmd_teleop_.last  = *msg;
-        cmd_teleop_.stamp = now();
+        arbitrator_.updateSource("teleop", *msg, now());
       });
 
     cmd_safe_sub_ = create_subscription<geometry_msgs::msg::Twist>(
-      "/cmd_vel_safe", rclcpp::QoS(10),
+      "/cmd_vel_safe", 10,
       [this](geometry_msgs::msg::Twist::SharedPtr msg) {
-        cmd_safe_.last  = *msg;
-        cmd_safe_.stamp = now();
+        arbitrator_.updateSource("safe", *msg, now());
       });
 
-    // --- Emergency stop (latched) ---
     estop_sub_ = create_subscription<std_msgs::msg::Bool>(
-      "/emergency_stop",
-      rclcpp::QoS(1).reliable(),   // ❌ убрать transient_local()
+      "/emergency_stop", rclcpp::QoS(1).reliable(),
       std::bind(&BaseControllerNode::emergencyStopCallback, this, std::placeholders::_1)
     );
 
-    // --- Diagnostics ---
     diag_pub_ = create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
-      "/diagnostics", rclcpp::QoS(10)
+      "/diagnostics", 10
     );
+
+    reset_emergency_srv_ =
+      create_service<std_srvs::srv::Trigger>(
+        "/reset_emergency",
+        std::bind(&BaseControllerNode::resetEmergencyCallback, this,
+                  std::placeholders::_1, std::placeholders::_2)
+      );
+
+    enable_motion_srv_ =
+      create_service<std_srvs::srv::Trigger>(
+        "/enable_motion",
+        std::bind(&BaseControllerNode::enableMotionCallback, this,
+                  std::placeholders::_1, std::placeholders::_2)
+      );
+
+    safety_state_      = SafetyState::SAFE;
+    emergency_latched_ = false;
+    robot_state_.motion_enabled = false;
 
     RCLCPP_INFO(get_logger(), "Configured");
     return CallbackReturn::SUCCESS;
@@ -105,7 +147,9 @@ public:
   {
     control_timer_.reset();
     sendStop();
-    RCLCPP_WARN(get_logger(), "Deactivated → STOP");
+    safety_state_ = SafetyState::SAFE;
+
+    RCLCPP_WARN(get_logger(), "Deactivated → SAFE");
     return CallbackReturn::SUCCESS;
   }
 
@@ -119,9 +163,10 @@ public:
     cmd_safe_sub_.reset();
     estop_sub_.reset();
     diag_pub_.reset();
-
-    emergency_stop_ = false;
     driver_client_.reset();
+
+    emergency_latched_ = false;
+    safety_state_      = SafetyState::SAFE;
 
     RCLCPP_INFO(get_logger(), "Cleaned up");
     return CallbackReturn::SUCCESS;
@@ -136,55 +181,45 @@ public:
 
 private:
   // ============================================================
-  // Command arbitration
+  // Services
   // ============================================================
 
-  struct CmdSource
+  void enableMotionCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
   {
-    geometry_msgs::msg::Twist last;
-    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
-    int priority{0};
-    std::string name;
-  };
-
-  CmdSource cmd_nav_;
-  CmdSource cmd_teleop_;
-  CmdSource cmd_safe_;
-
-  geometry_msgs::msg::Twist selectCommand(std::string & active_source)
-  {
-    geometry_msgs::msg::Twist stop;
-    stop.linear.x  = 0.0;
-    stop.angular.z = 0.0;
-
-    if (emergency_stop_) {
-      active_source = "emergency";
-      return stop;
+    if (safety_state_ != SafetyState::SAFE || robot_state_.driver_fault) {
+      response->success = false;
+      response->message = "Cannot enable motion";
+      return;
     }
 
-    auto now_t = now();
-    CmdSource * best = nullptr;
+    robot_state_.motion_enabled = true;
 
-    auto consider = [&](CmdSource & src) {
-      const double age_ms =
-        (now_t - src.stamp).seconds() * 1000.0;
-      if (age_ms > cmd_vel_timeout_ms_) return;
-      if (!best || src.priority > best->priority) {
-        best = &src;
-      }
-    };
+    RCLCPP_WARN(get_logger(), "Motion ENABLED by operator");
 
-    consider(cmd_nav_);
-    consider(cmd_teleop_);
-    consider(cmd_safe_);
+    response->success = true;
+    response->message = "Motion enabled";
+  }
 
-    if (!best) {
-      active_source = "none";
-      return stop;
+  void resetEmergencyCallback(
+    const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+    std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+  {
+    if (safety_state_ != SafetyState::EMERGENCY) {
+      response->success = false;
+      response->message = "No active emergency";
+      return;
     }
 
-    active_source = best->name;
-    return best->last;
+    emergency_latched_ = false;
+    robot_state_.motion_enabled = false;
+    safety_state_ = SafetyState::SAFE;
+
+    RCLCPP_WARN(get_logger(), "Emergency reset by operator");
+
+    response->success = true;
+    response->message = "Emergency reset";
   }
 
   // ============================================================
@@ -193,15 +228,9 @@ private:
 
   void emergencyStopCallback(const std_msgs::msg::Bool::SharedPtr msg)
   {
-    if (msg->data) {
-      if (!emergency_stop_) {
-        RCLCPP_ERROR(get_logger(), "!!! EMERGENCY STOP ACTIVATED !!!");
-        sendStop();
-      }
-      emergency_stop_ = true;
-    } else {
-      RCLCPP_WARN(get_logger(), "Emergency stop RESET");
-      emergency_stop_ = false;
+    if (msg->data && !emergency_latched_) {
+      emergency_latched_ = true;
+      RCLCPP_ERROR(get_logger(), "!!! EMERGENCY STOP LATCHED !!!");
     }
   }
 
@@ -211,33 +240,66 @@ private:
 
   void controlLoop()
   {
-    if (get_current_state().id() !=
-        lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+    updateRobotState();
+    updateSafetyState();
+
+    geometry_msgs::msg::Twist cmd = computeOutputCommand();
+    publishDiagnostics();
+
+    if (driver_client_) {
+      driver_client_->submit(cmd);
+    }
+  }
+
+  void updateSafetyState()
+  {
+    if (emergency_latched_) {
+      safety_state_ = SafetyState::EMERGENCY;
       return;
     }
 
-    if (!driver_client_) {
+    if (!robot_state_.motion_enabled ||
+        get_current_state().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE ||
+        robot_state_.driver_fault ||
+        !robot_state_.driver_ready) {
+      safety_state_ = SafetyState::SAFE;
       return;
     }
 
-    driver_ok_ = driver_client_->isHealthy();
+    const double feedback_age_ms =
+      (now() - robot_state_.last_feedback_ts).seconds() * 1000.0;
 
-    std::string active_source;
-    geometry_msgs::msg::Twist cmd = selectCommand(active_source);
+    if (feedback_age_ms > feedback_timeout_ms_) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "Driver feedback timeout (%.0f ms) → SAFE STOP", feedback_age_ms);
+      safety_state_ = SafetyState::SAFE;
+      return;
+    }
 
-    watchdog_triggered_ = (active_source == "none");
+    std::string src;
+    arbitrator_.select(now(), src, false);
 
-    publishDiagnostics(active_source);
+    safety_state_ = (src == "none")
+      ? SafetyState::SAFE
+      : SafetyState::OPERATIONAL;
+  }
 
-    driver_client_->submit(cmd);
+  geometry_msgs::msg::Twist computeOutputCommand()
+  {
+    geometry_msgs::msg::Twist stop;
+
+    if (safety_state_ != SafetyState::OPERATIONAL) {
+      return stop;
+    }
+
+    std::string src;
+    return arbitrator_.select(now(), src, false);
   }
 
   void sendStop()
   {
     geometry_msgs::msg::Twist stop;
-    stop.linear.x  = 0.0;
-    stop.angular.z = 0.0;
-
     if (driver_client_) {
       driver_client_->submit(stop);
     }
@@ -247,7 +309,7 @@ private:
   // Diagnostics
   // ============================================================
 
-  void publishDiagnostics(const std::string & active_source)
+  void publishDiagnostics()
   {
     if (!diag_pub_) return;
 
@@ -258,77 +320,47 @@ private:
     status.name = "base_controller";
     status.hardware_id = "base_controller";
 
-    if (emergency_stop_) {
-      status.level   = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-      status.message = "EMERGENCY STOP ACTIVE";
+    switch (safety_state_) {
+      case SafetyState::EMERGENCY:
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+        status.message = "EMERGENCY";
+        break;
+      case SafetyState::SAFE:
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+        status.message = "SAFE";
+        break;
+      case SafetyState::OPERATIONAL:
+        status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+        status.message = "OPERATIONAL";
+        break;
     }
-    else if (!driver_ok_) {
-      status.level   = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
-      status.message = "Driver unhealthy";
-    }
-    else if (watchdog_triggered_) {
-      status.level   = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-      status.message = "No active command";
-    }
-    else {
-      status.level   = diagnostic_msgs::msg::DiagnosticStatus::OK;
-      status.message = "OK";
-    }
-
-    diagnostic_msgs::msg::KeyValue kv;
-
-    kv.key = "active_source";
-    kv.value = active_source;
-    status.values.push_back(kv);
-
-    kv.key = "emergency_stop";
-    kv.value = emergency_stop_ ? "true" : "false";
-    status.values.push_back(kv);
-
-    kv.key = "driver_ok";
-    kv.value = driver_ok_ ? "true" : "false";
-    status.values.push_back(kv);
 
     array.status.push_back(status);
     diag_pub_->publish(array);
   }
 
 private:
-  // ============================================================
-  // ROS interfaces
-  // ============================================================
-
+  // ROS
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_emergency_srv_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr enable_motion_srv_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_nav_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_teleop_sub_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_safe_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr estop_sub_;
-
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diag_pub_;
   rclcpp::TimerBase::SharedPtr control_timer_;
 
-  // ============================================================
-  // State
-  // ============================================================
+  RobotState robot_state_;
+  SafetyState safety_state_{SafetyState::SAFE};
+  bool emergency_latched_{false};
 
-  bool emergency_stop_{false};
-  bool driver_ok_{false};
-  bool watchdog_triggered_{false};
+  CommandArbitrator arbitrator_;
+  std::unique_ptr<AsyncDriverClient> driver_client_;
 
-  // ============================================================
-  // Parameters
-  // ============================================================
-
+  int feedback_timeout_ms_{500};
   double control_rate_hz_{20.0};
   int cmd_vel_timeout_ms_{200};
-  double max_linear_mps_{0.6};
-  double max_angular_rps_{1.2};
   std::string driver_endpoint_;
-
-  // ============================================================
-  // Driver
-  // ============================================================
-
-  std::unique_ptr<AsyncDriverClient> driver_client_;
 };
 
 // ============================================================
@@ -340,7 +372,6 @@ int main(int argc, char ** argv)
   rclcpp::init(argc, argv);
 
   auto node = std::make_shared<BaseControllerNode>();
-
   rclcpp::executors::SingleThreadedExecutor exec;
   exec.add_node(node->get_node_base_interface());
   exec.spin();
