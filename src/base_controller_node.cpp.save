@@ -1,0 +1,98 @@
+
+#include <chrono>
+#include <memory>
+#include <algorithm>
+
+#include "rclcpp/rclcpp.hpp"
+#include "geometry_msgs/msg/twist.hpp"
+
+using namespace std::chrono_literals;
+
+class BaseControllerNode : public rclcpp::Node
+{
+public:
+  BaseControllerNode()
+  : Node("base_controller")
+  {
+    // Parameters
+    control_rate_hz_ = this->declare_parameter<double>("control_rate_hz", 20.0);
+    cmd_vel_timeout_ms_ = this->declare_parameter<int>("cmd_vel_timeout_ms", 200);
+    max_linear_mps_ = this->declare_parameter<double>("max_linear_mps", 0.6);
+    max_angular_rps_ = this->declare_parameter<double>("max_angular_rps", 1.2);
+    driver_endpoint_ = this->declare_parameter<std::string>(
+        "driver_endpoint", "http://localhost:8105");
+
+    RCLCPP_INFO(get_logger(),
+      "BaseController started (%.1f Hz, timeout=%d ms)",
+      control_rate_hz_, cmd_vel_timeout_ms_);
+
+    cmd_vel_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
+      "/cmd_vel",
+      rclcpp::QoS(10),
+      std::bind(&BaseControllerNode::cmdVelCallback, this, std::placeholders::_1));
+
+    control_timer_ = this->create_wall_timer(
+      std::chrono::duration<double>(1.0 / control_rate_hz_),
+      std::bind(&BaseControllerNode::controlLoop, this));
+  }
+
+private:
+  void cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg)
+  {
+    last_cmd_vel_ = *msg;
+    last_cmd_time_ = this->now();
+  }
+
+  void controlLoop()
+  {
+    auto now = this->now();
+    double age_ms =
+      (now - last_cmd_time_).seconds() * 1000.0;
+
+    geometry_msgs::msg::Twist cmd;
+
+    if (age_ms > cmd_vel_timeout_ms_) {
+      // Watchdog → stop
+      cmd.linear.x = 0.0;
+      cmd.angular.z = 0.0;
+    } else {
+      // Clamp velocities
+      cmd.linear.x = std::clamp(
+        last_cmd_vel_.linear.x,
+        -max_linear_mps_,
+        max_linear_mps_);
+
+      cmd.angular.z = std::clamp(
+        last_cmd_vel_.angular.z,
+        -max_angular_rps_,
+        max_angular_rps_);
+    }
+
+    // 🔌 PLACEHOLDER: sendToDriver(cmd)
+    RCLCPP_DEBUG(get_logger(),
+      "cmd: lin=%.3f ang=%.3f",
+      cmd.linear.x,
+      cmd.angular.z);
+  }
+
+private:
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
+  rclcpp::TimerBase::SharedPtr control_timer_;
+
+  geometry_msgs::msg::Twist last_cmd_vel_;
+  rclcpp::Time last_cmd_time_{0, 0, RCL_ROS_TIME};
+
+  double control_rate_hz_;
+  int cmd_vel_timeout_ms_;
+  double max_linear_mps_;
+  double max_angular_rps_;
+  std::string driver_endpoint_;
+};
+
+int main(int argc, char **argv)
+{
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<BaseControllerNode>());
+  rclcpp::shutdown();
+  return 0;
+}
